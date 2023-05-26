@@ -29,8 +29,8 @@ internal class WineHelper
 		}
 		else
 		{
-			Log.Information("Did not detect Wine, but hntdll existed." + hntdll);
-			return true;
+			Log.Information("Did not detect Wine, but hntdll existed. " + hntdll);
+			return false;
 		}
 	}
 
