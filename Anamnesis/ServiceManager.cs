@@ -130,6 +130,12 @@ public class ServiceManager
 
 	private static void CheckWindowsVersion()
 	{
+		if (Utils.WineHelper.CheckIfWine())
+		{
+			Log.Information("Detected Wine. Skipping Windows version check, I hope you know what you are doing.");
+			return;
+		}
+
 		OperatingSystem os = Environment.OSVersion;
 		if (os.Platform != PlatformID.Win32NT)
 			throw new Exception("Only Windows NT or later is supported");
