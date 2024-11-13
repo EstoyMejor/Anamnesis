@@ -14,7 +14,7 @@ using Lumina.Excel.GeneratedSheets;
 
 using ExcelRow = Anamnesis.GameData.Sheets.ExcelRow;
 
-[Sheet("BNpcBase", 0x86278126)]
+[Sheet("BNpcBase", 0xb8cbad27)]
 public class BattleNpc : ExcelRow, INpcBase
 {
 	private string? name;
@@ -35,8 +35,8 @@ public class BattleNpc : ExcelRow, INpcBase
 
 	public bool IsFavorite
 	{
-		get => FavoritesService.IsFavorite(this);
-		set => FavoritesService.SetFavorite(this, value);
+		get => FavoritesService.IsFavorite<INpcBase>(this);
+		set => FavoritesService.SetFavorite<INpcBase>(this, nameof(FavoritesService.Favorites.Models), value);
 	}
 
 	public override void PopulateData(RowParser parser, Lumina.GameData gameData, Language language)

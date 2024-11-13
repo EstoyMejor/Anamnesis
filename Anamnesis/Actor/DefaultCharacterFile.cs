@@ -5,6 +5,7 @@ namespace Anamnesis.Actor;
 
 using Anamnesis.Files;
 using Anamnesis.Memory;
+using System.Numerics;
 
 public static class DefaultCharacterFile
 {
@@ -38,10 +39,11 @@ public static class DefaultCharacterFile
 		Bust = 50,
 		FacePaint = 0,
 		FacePaintColor = 0,
+		Glasses = new CharacterFile.GlassesSave(),
 		MainHand = new CharacterFile.WeaponSave()
 		{
 			Color = Color.Black,
-			Scale = Vector.One,
+			Scale = Vector3.One,
 			ModelSet = 301,
 			ModelBase = 31,
 			ModelVariant = 1,
@@ -50,7 +52,7 @@ public static class DefaultCharacterFile
 		OffHand = new CharacterFile.WeaponSave()
 		{
 			Color = Color.Black,
-			Scale = Vector.One,
+			Scale = Vector3.One,
 			ModelSet = 301,
 			ModelBase = 31,
 			ModelVariant = 1,

@@ -3,38 +3,49 @@
 
 namespace Anamnesis.Actor;
 
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Threading.Tasks;
-using System.Windows;
-using System.Windows.Input;
-using System.Windows.Media.Media3D;
 using Anamnesis.Actor.Posing;
 using Anamnesis.Memory;
 using Anamnesis.Posing;
 using Anamnesis.Services;
 using PropertyChanged;
 using Serilog;
-using XivToolsWpf;
-using System.Linq;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO.Enumeration;
-
-using AnQuaternion = Anamnesis.Memory.Quaternion;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media.Media3D;
+using XivToolsWpf;
+using XivToolsWpf.Math3D.Extensions;
+using AnQuaternion = System.Numerics.Quaternion;
 
 [AddINotifyPropertyChangedInterface]
 public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 {
-	public readonly Dictionary<string, BoneVisual3d> Bones = new Dictionary<string, BoneVisual3d>();
-	public readonly List<BoneVisual3d> SelectedBones = new List<BoneVisual3d>();
-	public readonly HashSet<BoneVisual3d> HoverBones = new HashSet<BoneVisual3d>();
+	public readonly Dictionary<string, BoneVisual3d> Bones = new();
+	public readonly List<BoneVisual3d> SelectedBones = new();
+	public readonly HashSet<BoneVisual3d> HoverBones = new();
 
 	private readonly QuaternionRotation3D rootRotation;
-	private readonly List<BoneVisual3d> hairBones = new List<BoneVisual3d>();
-	private readonly List<BoneVisual3d> metBones = new List<BoneVisual3d>();
-	private readonly List<BoneVisual3d> topBones = new List<BoneVisual3d>();
-	private readonly List<BoneVisual3d> mainHandBones = new List<BoneVisual3d>();
-	private readonly List<BoneVisual3d> offHandBones = new List<BoneVisual3d>();
+	private readonly List<BoneVisual3d> rootBones = new();
+	private readonly List<BoneVisual3d> hairBones = new();
+	private readonly List<BoneVisual3d> metBones = new();
+	private readonly List<BoneVisual3d> topBones = new();
+	private readonly List<BoneVisual3d> mainHandBones = new();
+	private readonly List<BoneVisual3d> offHandBones = new();
+
+	private readonly Dictionary<string, Tuple<string, string>> hairNameToSuffixMap = new()
+	{
+		{ "HairAutoFrontLeft", new("l", "j_kami_f_l") },	// Hair, Front Left
+		{ "HairAutoFrontRight", new("r", "j_kami_f_r") },	// Hair, Front Right
+		{ "HairAutoA", new("a", "j_kami_a") },				// Hair, Back Up
+		{ "HairAutoB", new("b", "j_kami_b") },				// Hair, Back Down
+		{ "HairFront", new("f", string.Empty) },			// Hair, Front (Custom Bone Name)
+	};
 
 	public SkeletonVisual3d()
 	{
@@ -98,7 +109,7 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 		|| this.Actor?.Customize?.Race == ActorCustomizeMemory.Races.Hrothgar
 		|| this.IsIVCS;
 
-	public bool IsCustomFace => this.Actor == null ? false : this.IsMiqote || this.IsHrothgar;
+	public bool IsStandardFace => this.Actor == null ? true : !this.IsMiqote && !this.IsHrothgar && !this.IsViera;
 	public bool IsMiqote => this.Actor?.Customize?.Race == ActorCustomizeMemory.Races.Miqote;
 	public bool IsViera => this.Actor?.Customize?.Race == ActorCustomizeMemory.Races.Viera;
 	public bool IsElezen => this.Actor?.Customize?.Race == ActorCustomizeMemory.Races.Elezen;
@@ -134,6 +145,20 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 		}
 	}
 
+	public bool HasPreDTFace
+	{
+		get
+		{
+			// We can determine if we have a DT-updated face if we have a tongue bone.
+			// EW faces don't have this bone, where as all updated faces in DT have it.
+			// It would be better to enumerate all of the faces and be more specific.
+			BoneVisual3d? tongueABone = this.GetBone("j_f_bero_01");
+			if (tongueABone == null)
+				return true;
+			return false;
+		}
+	}
+
 	public AnQuaternion RootRotation
 	{
 		get
@@ -148,7 +173,6 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 	{
 		this.ClearSelection();
 		this.ClearBones();
-		this.HoverBones.Clear();
 		this.Children.Clear();
 	}
 
@@ -260,6 +284,9 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 
 	public void ClearSelection()
 	{
+		if (this.SelectedBones.Count == 0)
+			return;
+
 		this.SelectedBones.Clear();
 
 		Application.Current?.Dispatcher.Invoke(() =>
@@ -297,6 +324,11 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 	public void NotifyHover()
 	{
 		this.RaisePropertyChanged(nameof(SkeletonVisual3d.HasHover));
+	}
+
+	public void NotifySkeletonChanged()
+	{
+		this.RaisePropertyChanged(nameof(SkeletonVisual3d.AllBones));
 	}
 
 	public bool GetIsBoneHovered(BoneVisual3d bone)
@@ -341,7 +373,7 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 			return null;
 
 		// only show actors that have atleast one partial skeleton
-		if (this.Actor.ModelObject.Skeleton.Count <= 0)
+		if (this.Actor.ModelObject.Skeleton.Length <= 0)
 			return null;
 
 		string? modernName = LegacyBoneNameConverter.GetModernName(name);
@@ -349,9 +381,31 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 			name = modernName;
 
 		BoneVisual3d? bone;
-		this.Bones.TryGetValue(name, out bone);
 
+		// Attempt to find hairstyle-specific bones. If not found, default to the standard hair bones.
+		if (this.hairNameToSuffixMap.TryGetValue(name, out Tuple<string, string>? suffixAndDefault))
+		{
+			bone = this.FindHairBoneByPattern(suffixAndDefault.Item1);
+			if (bone != null)
+				return bone;
+			else
+				name = suffixAndDefault.Item2; // If not found, default to the standard hair bones.
+		}
+
+		this.Bones.TryGetValue(name, out bone);
 		return bone;
+	}
+
+	public void SelectBody()
+	{
+		this.SelectHead();
+		this.InvertSelection();
+
+		List<BoneVisual3d> additionalBones = new List<BoneVisual3d>();
+		BoneVisual3d? headBone = this.GetBone("j_kao");
+		if (headBone != null)
+			additionalBones.Add(headBone);
+		this.Select(additionalBones, SkeletonVisual3d.SelectMode.Add);
 	}
 
 	public void SelectHead()
@@ -411,21 +465,49 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 		this.Select(selection);
 	}
 
-	public void ReadTranforms()
+	public Dictionary<string, Transform> TakeSnapshot()
 	{
-		if (this.Bones == null)
+		var snapshot = new Dictionary<string, Transform>();
+
+		if (this.Actor?.ModelObject?.Skeleton == null)
+			return snapshot;
+
+		this.Actor.ModelObject.Skeleton.EnableReading = false;
+
+		foreach (var bone in this.AllBones)
+		{
+			snapshot[bone.BoneName] = new Transform
+			{
+				Position = bone.TransformMemory.Position,
+				Rotation = bone.TransformMemory.Rotation,
+				Scale = bone.TransformMemory.Scale,
+			};
+		}
+
+		this.Actor.ModelObject.Skeleton.EnableReading = true;
+
+		return snapshot;
+	}
+
+	public void ReadTransforms()
+	{
+		if (this.Bones == null || this.Actor?.ModelObject?.Skeleton == null)
 			return;
 
 		if (!GposeService.GetIsGPose())
 			return;
 
-		foreach ((string name, BoneVisual3d bone) in this.Bones)
-		{
-			if (this.GetIsBoneSelected(bone))
-				continue;
+		// Clear bone selection.
+		// This method should only be called while the user cannot interact with the bones.
+		this.ClearSelection();
 
-			bone.Tick();
-			bone.ReadTransform();
+		// Take a snapshot of the current transforms
+		var snapshot = this.TakeSnapshot();
+
+		// Read skeleton transforms, starting from the root bones
+		foreach (var rootBone in this.rootBones)
+		{
+			rootBone.ReadTransform(true, snapshot);
 		}
 	}
 
@@ -451,7 +533,7 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 	public async Task SetActor(ActorMemory actor)
 	{
 		if (this.Actor != null && this.Actor.ModelObject?.Transform != null)
-			this.Actor.ModelObject.Transform.PropertyChanged += this.OnTransformPropertyChanged;
+			this.Actor.ModelObject.Transform.PropertyChanged -= this.OnTransformPropertyChanged;
 
 		this.Actor = actor;
 
@@ -512,7 +594,7 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 					if (!links.Contains(name))
 						continue;
 
-					foreach(string linkedBoneName in links.Bones)
+					foreach (string linkedBoneName in links.Bones)
 					{
 						if (linkedBoneName == name)
 							continue;
@@ -533,12 +615,7 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 				bone.ReadTransform();
 			}
 
-			foreach ((string name, BoneVisual3d bone) in this.Bones)
-			{
-				bone.ReadTransform();
-			}
-
-			// check for ivcs bones
+			// Check for ivcs bones
 			this.IsIVCS = false;
 			foreach ((string name, BoneVisual3d bone) in this.Bones)
 			{
@@ -557,23 +634,31 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 
 	public void WriteSkeleton()
 	{
+		if (this.Actor == null || this.Actor.ModelObject?.Skeleton == null)
+			return;
+
 		if (this.CurrentBone != null && PoseService.Instance.IsEnabled)
 		{
-			try
+			lock (HistoryService.Instance.LockObject)
 			{
-				this.CurrentBone.WriteTransform(this);
-			}
-			catch (Exception ex)
-			{
-				Log.Error(ex, $"Failed to write bone transform: {this.CurrentBone.BoneName}");
-				this.ClearSelection();
+				try
+				{
+					this.Actor.PauseSynchronization = true;
+					this.CurrentBone.WriteTransform(this);
+					this.Actor.PauseSynchronization = false;
+				}
+				catch (Exception ex)
+				{
+					Log.Error(ex, $"Failed to write bone transform: {this.CurrentBone.BoneName}");
+					this.ClearSelection();
+				}
 			}
 		}
 	}
 
 	private void AddBones(SkeletonMemory skeleton, string? namePrefix = null)
 	{
-		for (int partialSkeletonIndex = 0; partialSkeletonIndex < skeleton.ItemCount; partialSkeletonIndex++)
+		for (int partialSkeletonIndex = 0; partialSkeletonIndex < skeleton.Length; partialSkeletonIndex++)
 		{
 			PartialSkeletonMemory partialSkeleton = skeleton[partialSkeletonIndex];
 
@@ -585,7 +670,7 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 				continue;
 			}
 
-			int count = bestHkaPose.Transforms.Count;
+			int count = bestHkaPose.Transforms.Length;
 
 			// Load all bones first
 			for (int boneIndex = partialSkeletonIndex == 0 ? 0 : 1; boneIndex < count; boneIndex++)
@@ -674,6 +759,10 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 					Log.Error(ex, $"Failed to parent bone: {boneName}");
 				}
 			}
+
+			// Find all root bones (bones without parents)
+			this.rootBones.Clear();
+			this.rootBones.AddRange(this.Bones.Values.Where(bone => bone.Parent == null));
 		}
 	}
 
@@ -698,6 +787,20 @@ public class SkeletonVisual3d : ModelVisual3D, INotifyPropertyChanged
 	private void RaisePropertyChanged(string propertyName)
 	{
 		this.PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+	}
+
+	private BoneVisual3d? FindHairBoneByPattern(string suffix)
+	{
+		string pattern = $@"j_ex_h\d{{4}}_ke_{suffix}";
+		Regex regex = new Regex(pattern);
+
+		foreach (var (boneName, bone) in this.Bones)
+		{
+			if (regex.IsMatch(boneName))
+				return bone;
+		}
+
+		return null;
 	}
 }
 

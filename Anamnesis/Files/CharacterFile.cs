@@ -3,12 +3,14 @@
 
 namespace Anamnesis.Files;
 
-using System;
-using System.Threading.Tasks;
 using Anamnesis.Actor.Utilities;
-using Anamnesis.GameData.Excel;
+using Anamnesis.GameData;
 using Anamnesis.Memory;
 using Serilog;
+using System;
+using System.Numerics;
+using System.Threading.Tasks;
+using XivToolsWpf.Math3D.Extensions;
 
 [Serializable]
 public class CharacterFile : JsonFileBase
@@ -25,6 +27,7 @@ public class CharacterFile : JsonFileBase
 		AppearanceFace = 16,
 		AppearanceBody = 32,
 		AppearanceExtended = 64,
+		EquipmentSlot = 128,
 
 		Equipment = EquipmentGear | EquipmentAccessories,
 		Appearance = AppearanceHair | AppearanceFace | AppearanceBody | AppearanceExtended,
@@ -85,6 +88,9 @@ public class CharacterFile : JsonFileBase
 	public ItemSave? LeftRing { get; set; }
 	public ItemSave? RightRing { get; set; }
 
+	// glasses
+	public GlassesSave? Glasses { get; set; }
+
 	// extended appearance
 	// NOTE: extended weapon values are stored in the WeaponSave
 	public Color? SkinColor { get; set; }
@@ -96,7 +102,7 @@ public class CharacterFile : JsonFileBase
 	public Color? HairGloss { get; set; }
 	public Color? HairHighlight { get; set; }
 	public Color4? MouthColor { get; set; }
-	public Vector? BustScale { get; set; }
+	public Vector3? BustScale { get; set; }
 	public float? Transparency { get; set; }
 	public float? MuscleTone { get; set; }
 	public float? HeightMultiplier { get; set; }
@@ -141,6 +147,10 @@ public class CharacterFile : JsonFileBase
 
 			if (actor.Equipment?.Feet != null)
 				this.Feet = new ItemSave(actor.Equipment.Feet);
+
+			// glasses - technically on the left side
+			if (actor.Glasses != null)
+				this.Glasses = new GlassesSave(actor.Glasses);
 		}
 
 		if (this.IncludeSection(SaveModes.EquipmentAccessories, mode))
@@ -218,7 +228,12 @@ public class CharacterFile : JsonFileBase
 		}
 	}
 
-	public async Task Apply(ActorMemory actor, SaveModes mode, bool allowRefresh = true)
+	public async Task Apply(ActorMemory actor, SaveModes mode, ItemSlots? slot = null)
+	{
+		await Task.Run(() => this.ApplyInternal(actor, mode, slot));
+	}
+
+	public void ApplyInternal(ActorMemory actor, SaveModes mode, ItemSlots? slot = null)
 	{
 		if (this.Tribe == 0)
 			this.Tribe = ActorCustomizeMemory.Tribes.Midlander;
@@ -235,13 +250,14 @@ public class CharacterFile : JsonFileBase
 		if (actor.Customize == null)
 			return;
 
-		Log.Information("Reading appearance from file");
+		if (this.Glasses == null)
+			this.Glasses = new GlassesSave();
 
-		actor.AutomaticRefreshEnabled = false;
+		Log.Information("Reading appearance from file");
 
 		if (actor.CanRefresh)
 		{
-			actor.EnableReading = false;
+			actor.PauseSynchronization = true;
 
 			if (!string.IsNullOrEmpty(this.Nickname))
 				actor.Nickname = this.Nickname;
@@ -263,6 +279,7 @@ public class CharacterFile : JsonFileBase
 				this.Hands?.Write(actor.Equipment?.Arms);
 				this.Legs?.Write(actor.Equipment?.Legs);
 				this.Feet?.Write(actor.Equipment?.Feet);
+				this.Glasses?.Write(actor.Glasses);
 			}
 
 			if (this.IncludeSection(SaveModes.EquipmentAccessories, mode))
@@ -272,6 +289,54 @@ public class CharacterFile : JsonFileBase
 				this.Wrists?.Write(actor.Equipment?.Wrist);
 				this.RightRing?.Write(actor.Equipment?.RFinger);
 				this.LeftRing?.Write(actor.Equipment?.LFinger);
+			}
+
+			if (mode == SaveModes.EquipmentSlot && slot != null)
+			{
+				switch (slot)
+				{
+					case ItemSlots.MainHand:
+						this.MainHand?.Write(actor.MainHand, true);
+						actor.IsWeaponDirty = true;
+						break;
+					case ItemSlots.OffHand:
+						this.OffHand?.Write(actor.OffHand, false);
+						actor.IsWeaponDirty = true;
+						break;
+					case ItemSlots.Head:
+						this.HeadGear?.Write(actor.Equipment?.Head);
+						break;
+					case ItemSlots.Body:
+						this.Body?.Write(actor.Equipment?.Chest);
+						break;
+					case ItemSlots.Hands:
+						this.Hands?.Write(actor.Equipment?.Arms);
+						break;
+					case ItemSlots.Legs:
+						this.Legs?.Write(actor.Equipment?.Legs);
+						break;
+					case ItemSlots.Feet:
+						this.Feet?.Write(actor.Equipment?.Feet);
+						break;
+					case ItemSlots.Ears:
+						this.Ears?.Write(actor.Equipment?.Ear);
+						break;
+					case ItemSlots.Neck:
+						this.Neck?.Write(actor.Equipment?.Neck);
+						break;
+					case ItemSlots.Wrists:
+						this.Wrists?.Write(actor.Equipment?.Wrist);
+						break;
+					case ItemSlots.LeftRing:
+						this.LeftRing?.Write(actor.Equipment?.LFinger);
+						break;
+					case ItemSlots.RightRing:
+						this.RightRing?.Write(actor.Equipment?.RFinger);
+						break;
+					case ItemSlots.Glasses:
+						this.Glasses?.Write(actor.Glasses);
+						break;
+				}
 			}
 
 			if (this.IncludeSection(SaveModes.AppearanceHair, mode))
@@ -364,14 +429,10 @@ public class CharacterFile : JsonFileBase
 					actor.Customize.Bust = (byte)this.Bust;
 			}
 
-			if (allowRefresh)
-			{
-				await actor.RefreshAsync();
-			}
-
 			// Setting customize values will reset the extended appearance, which me must read.
-			actor.EnableReading = true;
-			actor.Tick();
+			actor.PauseSynchronization = false;
+			actor.Synchronize();
+			actor.PauseSynchronization = true;
 		}
 
 		Log.Verbose("Begin reading Extended Appearance from file");
@@ -403,15 +464,14 @@ public class CharacterFile : JsonFileBase
 				if (Float.IsValid(this.HeightMultiplier))
 					actor.ModelObject.Height = this.HeightMultiplier ?? actor.ModelObject.Height;
 
-				if (actor.ModelObject.Bust?.Scale != null && Vector.IsValid(this.BustScale))
+				if (actor.ModelObject.Bust?.Scale != null && this.BustScale.IsValid())
 				{
 					actor.ModelObject.Bust.Scale = this.BustScale ?? actor.ModelObject.Bust.Scale;
 				}
 			}
 		}
 
-		actor.AutomaticRefreshEnabled = true;
-		actor.EnableReading = true;
+		actor.PauseSynchronization = false;
 
 		Log.Information("Finished reading appearance from file");
 	}
@@ -438,7 +498,7 @@ public class CharacterFile : JsonFileBase
 		}
 
 		public Color Color { get; set; }
-		public Vector Scale { get; set; }
+		public Vector3 Scale { get; set; }
 		public ushort ModelSet { get; set; }
 		public ushort ModelBase { get; set; }
 		public ushort ModelVariant { get; set; }
@@ -510,6 +570,34 @@ public class CharacterFile : JsonFileBase
 			vm.Variant = this.ModelVariant;
 			vm.Dye = this.DyeId;
 			vm.Dye2 = this.DyeId2;
+		}
+	}
+
+	[Serializable]
+	public class GlassesSave
+	{
+		public GlassesSave()
+		{
+			this.GlassesId = 0;
+		}
+
+		public GlassesSave(GlassesMemory from)
+		{
+			this.GlassesId = from.GlassesId;
+		}
+
+		public GlassesSave(ushort glassesId)
+		{
+			this.GlassesId = glassesId;
+		}
+
+		public ushort GlassesId { get; set; }
+
+		public void Write(GlassesMemory? glasses)
+		{
+			if (glasses == null)
+				return;
+			glasses.GlassesId = this.GlassesId;
 		}
 	}
 }

@@ -3,20 +3,22 @@
 
 namespace Anamnesis.Files;
 
+using Anamnesis.Actor;
+using Anamnesis.Memory;
+using Anamnesis.Posing;
+using Serilog;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Numerics;
 using System.Threading.Tasks;
-using Anamnesis.Memory;
-using Anamnesis.Actor;
-using Anamnesis.Posing;
-using Serilog;
 
 public class PoseFile : JsonFileBase
 {
 	[Flags]
 	public enum Mode
 	{
+		None = 0,
 		Rotation = 1,
 		Scale = 2,
 		Position = 4,
@@ -36,28 +38,15 @@ public class PoseFile : JsonFileBase
 	public override string FileExtension => ".pose";
 	public override string TypeName => "Anamnesis Pose";
 
-	public Vector? Position { get; set; }
+	public Vector3? Position { get; set; }
 	public Quaternion? Rotation { get; set; }
-	public Vector? Scale { get; set; }
+	public Vector3? Scale { get; set; }
 
 	public Dictionary<string, Bone?>? Bones { get; set; }
 
 	public static BoneProcessingModes GetBoneMode(ActorMemory? actor, SkeletonVisual3d? skeleton, string boneName)
 	{
-		if (boneName == "n_root")
-			return BoneProcessingModes.Ignore;
-
-		// Special case for elezen ears as they cannot use other races ear values.
-		if (actor?.Customize?.Race == ActorCustomizeMemory.Races.Elezen)
-		{
-			// append '_elezen' to both ear bones.
-			if (boneName == "j_mimi_l" || boneName == "j_mimi_r")
-			{
-				return BoneProcessingModes.KeepRelative;
-			}
-		}
-
-		return BoneProcessingModes.FullLoad;
+		return boneName != "n_root" ? BoneProcessingModes.FullLoad : BoneProcessingModes.Ignore;
 	}
 
 	public static async Task<DirectoryInfo?> Save(DirectoryInfo? dir, ActorMemory? actor, SkeletonVisual3d? skeleton, HashSet<string>? bones = null, bool editMeta = false)
@@ -105,7 +94,7 @@ public class PoseFile : JsonFileBase
 		}
 	}
 
-	public async Task Apply(ActorMemory actor, SkeletonVisual3d skeleton, HashSet<string>? bones, Mode mode)
+	public void Apply(ActorMemory actor, SkeletonVisual3d skeleton, HashSet<string>? bones, Mode mode, bool doFacialExpressionHack)
 	{
 		if (actor == null)
 			throw new ArgumentNullException(nameof(actor));
@@ -114,7 +103,7 @@ public class PoseFile : JsonFileBase
 			throw new Exception("Actor has no model");
 
 		if (actor.ModelObject.Skeleton == null)
-			throw new Exception("Actor model has no skeleton");
+			throw new Exception("Actor model has no skeleton. Are you trying to load a pose outside of GPose?");
 
 		if (this.Bones == null)
 			return;
@@ -127,45 +116,129 @@ public class PoseFile : JsonFileBase
 
 		if (bones == null)
 		{
-			if (mode.HasFlag(Mode.WorldScale) && this.Scale != null)
-				actor.ModelObject.Transform.Scale = (Vector)this.Scale;
+			if (mode.HasFlag(Mode.WorldScale) && this.Scale.HasValue)
+				actor.ModelObject.Transform.Scale = this.Scale.Value;
 
-			if (mode.HasFlag(Mode.WorldRotation) && this.Rotation != null)
-				actor.ModelObject.Transform.Rotation = (Quaternion)this.Rotation;
+			if (mode.HasFlag(Mode.WorldRotation) && this.Rotation.HasValue)
+				actor.ModelObject.Transform.Rotation = this.Rotation.Value;
 		}
 
-		SkeletonMemory? skeletonMem = actor.ModelObject.Skeleton;
+		SkeletonMemory skeletonMem = actor.ModelObject.Skeleton;
 
 		PoseService.Instance.SetEnabled(true);
 		PoseService.Instance.CanEdit = false;
-		await Task.Delay(100);
+		skeletonMem.PauseSynchronization = true;
 
-		// Create a back up of the relative rotations of every bones
-		Dictionary<string, Quaternion> unPosedBoneRotations = new Dictionary<string, Quaternion>();
+		// Create a backup of all bone transforms
+		// Keep in mind that unposed bone transforms is a collection of character-relative transforms.
+		// Meanwhile, posed bone positions is a collection of parent-relative positions.
+		Dictionary<string, Transform> unposedBoneTransforms = new();
+		Dictionary<string, Vector3> posedBonePositions = new();
 		foreach ((string name, BoneVisual3d bone) in skeleton.Bones)
 		{
 			if (GetBoneMode(actor, skeleton, name) == BoneProcessingModes.Ignore)
 				continue;
 
-			unPosedBoneRotations.Add(name, bone.Rotation);
+			unposedBoneTransforms[bone.BoneName] = new Transform
+			{
+				Position = bone.Position,
+				Rotation = bone.Rotation,
+				Scale = bone.Scale,
+			};
 		}
 
 		// Facial expressions hack:
 		// Since all facial bones are parented to the head, if we load the head rotation from
 		// the pose that matches the expression, it wont break.
 		// We then just set the head back to where it should be afterwards.
+		// We can skip this if we actually intend to pose the head
+		// in the case of posing by selected bones or by body.
 		BoneVisual3d? headBone = skeleton.GetBone("j_kao");
 		Quaternion? originalHeadRotation = null;
-		if (bones != null && bones.Contains("j_kao"))
+		Vector3? originalHeadPosition = null;
+		if (doFacialExpressionHack && bones != null && bones.Contains("j_kao"))
 		{
 			if (headBone == null)
 				throw new Exception("Unable to find head (j_kao) bone.");
 
-			headBone.Tick();
+			headBone.Synchronize();
 			originalHeadRotation = headBone?.Rotation;
+			originalHeadPosition = headBone?.Position;
 		}
 
-		// Apply all transforms a few times to ensure parent-inherited values are caluclated correctly, and to ensure
+		// Collect the parent-relative positions of all posed bones
+		foreach ((string name, Bone? savedBone) in this.Bones)
+		{
+			if (savedBone == null)
+				continue;
+
+			string boneName = LegacyBoneNameConverter.GetModernName(name) ?? name;
+
+			// Don't apply bones that cant be serialized.
+			if (GetBoneMode(actor, skeleton, boneName) != BoneProcessingModes.FullLoad)
+				continue;
+
+			BoneVisual3d? bone = skeleton.GetBone(boneName);
+
+			if (bone == null)
+			{
+				Log.Warning($"Bone: \"{boneName}\" not found");
+				continue;
+			}
+
+			if (bones != null && !bones.Contains(boneName))
+				continue;
+
+			unposedBoneTransforms.Remove(boneName);
+
+			foreach (TransformMemory transformMemory in bone.TransformMemories)
+			{
+				if (savedBone.Position != null && !mode.HasFlag(Mode.Position))
+				{
+					posedBonePositions.TryAdd(boneName, transformMemory.Position);
+				}
+			}
+		}
+
+		// Add unposed bone transform positions to posedBonePositions
+		// This is necessary to recover the positions of bones that are not explicitly
+		// written to while "Freeze Position" is enabled.
+		if (!mode.HasFlag(Mode.Position))
+		{
+			foreach (var unposedBone in unposedBoneTransforms)
+			{
+				if (!posedBonePositions.ContainsKey(unposedBone.Key))
+				{
+					BoneVisual3d? bone = skeleton.GetBone(unposedBone.Key);
+					if (bone == null)
+						continue;
+
+					// Position is retrieved from the memory, not the bone itself
+					posedBonePositions.Add(unposedBone.Key, bone.TransformMemory.Position);
+				}
+			}
+		}
+
+		// Record position changes if bones are posed without position to preserve positions.
+		foreach ((string name, Vector3 pos) in posedBonePositions)
+		{
+			BoneVisual3d? bone = skeleton.GetBone(name);
+
+			if (bone == null)
+				continue;
+
+			if (!bone.TransformMemory.Binds.TryGetValue("Position", out PropertyBindInfo? bindInfo))
+			{
+				Log.Error($"Failed to find position bind for bone: {name}");
+				continue;
+			}
+
+			PropertyChange change = new(bindInfo, pos, pos, PropertyChange.Origins.User);
+			change.ConfigureBindPath();
+			actor.History.Record(change);
+		}
+
+		// Apply all transforms a few times to ensure parent-inherited values are calculated correctly, and to ensure
 		// we dont end up with some values read during a ffxiv frame update.
 		for (int i = 0; i < 3; i++)
 		{
@@ -174,10 +247,7 @@ public class PoseFile : JsonFileBase
 				if (savedBone == null)
 					continue;
 
-				string boneName = name;
-				string? modernName = LegacyBoneNameConverter.GetModernName(name);
-				if (modernName != null)
-					boneName = modernName;
+				string boneName = LegacyBoneNameConverter.GetModernName(name) ?? name;
 
 				// Don't apply bones that cant be serialized.
 				if (GetBoneMode(actor, skeleton, boneName) != BoneProcessingModes.FullLoad)
@@ -194,14 +264,11 @@ public class PoseFile : JsonFileBase
 				if (bones != null && !bones.Contains(boneName))
 					continue;
 
-				// Remove this bone from the relative rotations backup
-				unPosedBoneRotations.Remove(boneName);
-
 				foreach (TransformMemory transformMemory in bone.TransformMemories)
 				{
 					if (savedBone.Position != null && mode.HasFlag(Mode.Position) && bone.CanTranslate)
 					{
-						transformMemory.Position = (Vector)savedBone.Position;
+						transformMemory.Position = (Vector3)savedBone.Position;
 					}
 
 					if (savedBone.Rotation != null && mode.HasFlag(Mode.Rotation) && bone.CanRotate)
@@ -211,41 +278,66 @@ public class PoseFile : JsonFileBase
 
 					if (savedBone.Scale != null && mode.HasFlag(Mode.Scale) && bone.CanScale)
 					{
-						transformMemory.Scale = (Vector)savedBone.Scale;
+						transformMemory.Scale = (Vector3)savedBone.Scale;
 					}
 				}
 
 				bone.ReadTransform();
 				bone.WriteTransform(skeleton, false);
 			}
-
-			await Task.Delay(1);
 		}
 
 		// Restore the head bone rotation if we were only loading an expression
-		if (headBone != null && originalHeadRotation != null)
+		if (headBone != null && originalHeadRotation != null && originalHeadPosition != null)
 		{
 			headBone.Rotation = (Quaternion)originalHeadRotation;
+			headBone.Position = (Vector3)originalHeadPosition;
 			headBone.WriteTransform(skeleton, true);
 		}
 
 		// Restore the relative rotations of any bones that we did not explicitly write to.
-		foreach ((string name, Quaternion rotation) in unPosedBoneRotations)
+		foreach ((string name, Transform transform) in unposedBoneTransforms)
 		{
 			BoneVisual3d? bone = skeleton.GetBone(name);
-
 			if (bone == null)
 				continue;
 
-			bone.Rotation = rotation;
+			bone.Rotation = transform.Rotation;
+			bone.Position = transform.Position;
+			bone.Scale = transform.Scale;
 			bone.WriteTransform(skeleton, false);
 		}
 
-		await Task.Delay(100);
-
-		skeletonMem.Tick();
+		skeletonMem.PauseSynchronization = false;
+		skeletonMem.WriteDelayedBinds();
 
 		PoseService.Instance.CanEdit = true;
+	}
+
+	public bool IsPreDTPoseFile()
+	{
+		if (this.Bones == null)
+			return false;
+
+		// Check to see if we have *any* face bones at all.
+		// If not, then the file is backwards compatibile.
+		bool hasFaceBones = false;
+		foreach ((string name, Bone? bone) in this.Bones)
+		{
+			if (name.StartsWith("j_f_"))
+			{
+				hasFaceBones = true;
+				break;
+			}
+		}
+
+		// Looking for the tongue-A bone, a new bone common to all races and genders added in DT.
+		// If we dont have it, we are assumed to be a pre-DT pose file.
+		// This doesn't account for users manually editing the JSON.
+		if (!hasFaceBones || !this.Bones.ContainsKey("j_f_bero_01"))
+			return true;
+
+		return false;
 	}
 
 	[Serializable]
@@ -262,8 +354,8 @@ public class PoseFile : JsonFileBase
 			this.Scale = boneVisual.TransformMemory.Scale;
 		}
 
-		public Vector? Position { get; set; }
+		public Vector3? Position { get; set; }
 		public Quaternion? Rotation { get; set; }
-		public Vector? Scale { get; set; }
+		public Vector3? Scale { get; set; }
 	}
 }

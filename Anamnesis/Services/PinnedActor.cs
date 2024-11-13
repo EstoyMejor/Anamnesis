@@ -3,18 +3,19 @@
 
 namespace Anamnesis;
 
-using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Threading.Tasks;
 using Anamnesis.Actor;
 using Anamnesis.Files;
+using Anamnesis.GameData;
 using Anamnesis.Memory;
 using Anamnesis.Services;
 using Anamnesis.Styles;
 using FontAwesome.Sharp;
 using PropertyChanged;
 using Serilog;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Threading.Tasks;
 using XivToolsWpf.Extensions;
 
 [AddINotifyPropertyChangedInterface]
@@ -146,7 +147,7 @@ public class PinnedActor : INotifyPropertyChanged, IDisposable
 				return;
 			}
 
-			if (this.IsGPoseActor && GposeService.Instance.IsOverworld)
+			if (this.IsGPoseActor && !GposeService.Instance.IsGpose)
 			{
 				Log.Information($"Actor: {this} was a gpose actor and we are now in the overworld");
 				this.Retarget();
@@ -162,7 +163,7 @@ public class PinnedActor : INotifyPropertyChanged, IDisposable
 
 			try
 			{
-				this.Memory.Tick();
+				this.Memory.Synchronize();
 			}
 			catch (Exception ex)
 			{
@@ -199,7 +200,7 @@ public class PinnedActor : INotifyPropertyChanged, IDisposable
 		}
 	}
 
-	public async Task RestoreCharacterBackup(BackupModes mode)
+	public async Task RestoreCharacterBackup(BackupModes mode, ItemSlots? slot = null)
 	{
 		CharacterFile? backup = null;
 
@@ -223,12 +224,10 @@ public class PinnedActor : INotifyPropertyChanged, IDisposable
 		}
 
 		this.isRestoringBackup = true;
-
-		bool allowRefresh = !GposeService.GetIsGPose();
-		await backup.Apply(memory, CharacterFile.SaveModes.All, allowRefresh);
+		await backup.Apply(memory, slot == null ? CharacterFile.SaveModes.All : CharacterFile.SaveModes.EquipmentSlot, slot);
 
 		// If we were a player, really make sure we are again.
-		if (allowRefresh && backup.ObjectKind == ActorTypes.Player)
+		if (backup.ObjectKind == ActorTypes.Player)
 		{
 			memory.ObjectKind = backup.ObjectKind;
 		}

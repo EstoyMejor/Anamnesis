@@ -3,12 +3,13 @@
 
 namespace Anamnesis.Actor;
 
-using System;
 using Anamnesis.Files;
 using Anamnesis.GameData;
 using Anamnesis.GameData.Excel;
 using Anamnesis.Memory;
 using Anamnesis.Services;
+using System;
+using System.Numerics;
 
 public static class INpcBaseExtensions
 {
@@ -36,6 +37,10 @@ public static class INpcBaseExtensions
 		else if (type == typeof(Mount))
 		{
 			t = 'M';
+		}
+		else if (type == typeof(Ornament))
+		{
+			t = 'O';
 		}
 		else
 		{
@@ -65,6 +70,7 @@ public static class INpcBaseExtensions
 				'E' => GameDataService.EventNPCs.Get(key),
 				'C' => GameDataService.Companions.Get(key),
 				'M' => GameDataService.Mounts.Get(key),
+				'O' => GameDataService.Ornaments.Get(key),
 				_ => throw new Exception($"Unrecognized Npc type key: {t}"),
 			};
 		}
@@ -177,7 +183,7 @@ public static class INpcBaseExtensions
 		CharacterFile.WeaponSave save = new CharacterFile.WeaponSave();
 
 		save.Color = Color.White;
-		save.Scale = Vector.One;
+		save.Scale = Vector3.One;
 		save.ModelSet = item.ModelSet;
 		save.ModelBase = item.ModelBase;
 		save.ModelVariant = item.ModelVariant;
